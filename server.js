@@ -7,14 +7,7 @@ app.use(cors());
 
 const PORT = process.env.PORT || 3000;
 
-// --- NotScare config ---
 const NOTSCARE_SITE = "https://notscare.me";
-const NOTSCARE_SEARCH_API = `${NOTSCARE_SITE}/api/v1/search`;
-
-// Optional: only needed if NotScare requires it for API search
-// Set in Render env vars: NOTSCARE_API_KEY=xxxx
-const NOTSCARE_API_KEY = process.env.NOTSCARE_API_KEY || "";
-
 const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36";
 const FETCH_TIMEOUT_MS = 12000;
@@ -103,66 +96,69 @@ function extractNotScareTimestampsFromText(text) {
   return out;
 }
 
+function pickTitleFromHref(href) {
+  // /movies/jump-scares-in-insidious-2010 -> "jump scares in insidious 2010"
+  try {
+    const u = new URL(href, NOTSCARE_SITE);
+    const slug = u.pathname.split("/").filter(Boolean).pop() || "";
+    const cleaned = slug
+      .replace(/-/g, " ")
+      .replace(/\b(jump|scares|in)\b/gi, (m) => m.toLowerCase());
+    return normalizeSpaces(cleaned);
+  } catch {
+    return "";
+  }
+}
+
 app.get("/api/health", (_req, res) => res.json({ status: "ok", source: "notscare" }));
 
-// --- SEARCH ---
-// Keeps same response shape as before: [{ title, url }]
+/**
+ * SEARCH (NO API KEY)
+ * Scrapes the public NotScare movies results page:
+ *   https://notscare.me/movies?q=<q>&search=<q>&page=1
+ *
+ * Returns: [{ title, url }]
+ */
 app.get("/api/search", async (req, res) => {
   try {
     const q = normalizeSpaces(req.query.q);
     if (!q || q.length < 2) return res.status(400).json({ error: "Missing or too-short query `q`." });
 
-    // Call NotScare API
-    const apiUrl = `${NOTSCARE_SEARCH_API}?q=${encodeURIComponent(q)}&limit=10`;
+    const searchUrl =
+      `${NOTSCARE_SITE}/movies?q=${encodeURIComponent(q)}&search=${encodeURIComponent(q)}&page=1`;
 
-    const headers = {
-      "User-Agent": UA,
-      Accept: "application/json",
-    };
-    if (NOTSCARE_API_KEY) headers["x-api-key"] = NOTSCARE_API_KEY;
+    const fetched = await fetchHtml(searchUrl);
+    if (!fetched.ok) return res.status(502).json({ error: `NotScare search failed: ${fetched.status}` });
 
-    const { controller, clear } = withTimeout(FETCH_TIMEOUT_MS);
-    let data;
-    try {
-      const resp = await fetch(apiUrl, { headers, signal: controller.signal });
-      if (!resp.ok) {
-        // If this happens and you expect search to work, set NOTSCARE_API_KEY in Render.
-        return res.status(502).json({ error: `NotScare search failed: ${resp.status}` });
-      }
-      data = await resp.json();
-    } finally {
-      clear();
-    }
-
-    // Be flexible about response shape:
-    // - { results: [...] }
-    // - or [...]
-    const rawResults = Array.isArray(data) ? data : Array.isArray(data?.results) ? data.results : [];
+    const $ = cheerio.load(fetched.html);
 
     const results = [];
     const seen = new Set();
 
-    for (const item of rawResults) {
-      const titleBase = normalizeSpaces(item?.title || item?.name || "");
-      if (!titleBase) continue;
+    // Prefer anchors that contain '/movies/' and are not just the search page itself.
+    $("a[href^='/movies/']").each((_, el) => {
+      const href = $(el).attr("href");
+      if (!href) return;
 
-      const year = item?.year ? String(item.year) : "";
-      const title = year ? `${titleBase} (${year})` : titleBase;
+      // Skip the search listing itself
+      if (href === "/movies" || href.startsWith("/movies?")) return;
 
-      // If API includes a URL/slug, use it.
-      let url = "";
-      if (item?.url && typeof item.url === "string") url = item.url;
-      else if (item?.slug && typeof item.slug === "string") url = `${NOTSCARE_SITE}/movies/${item.slug}`;
+      const full = `${NOTSCARE_SITE}${href}`;
+      if (!isValidNotScareMovieUrl(full)) return;
 
-      // If API does NOT provide a usable URL, skip (client will show no results).
-      if (!url || !isValidNotScareUrl(url)) continue;
+      if (seen.has(full)) return;
 
-      if (!seen.has(url)) {
-        seen.add(url);
-        results.push({ title, url });
-      }
-      if (results.length >= 10) break;
-    }
+      // Title text on these pages can be empty because the card is image-based.
+      // If empty, derive from the slug.
+      const textTitle = normalizeSpaces($(el).text());
+      const title = textTitle || pickTitleFromHref(full);
+
+      if (!title) return;
+
+      seen.add(full);
+      results.push({ title, url: full });
+      if (results.length >= 10) return false; // break .each
+    });
 
     res.json(results.slice(0, 10));
   } catch (e) {
@@ -172,8 +168,11 @@ app.get("/api/search", async (req, res) => {
   }
 });
 
-// --- TIMESTAMPS ---
-// Keeps same response shape: { url, title, timestamps: [...] }
+/**
+ * TIMESTAMPS
+ * Expects a NotScare movie page URL: https://notscare.me/movies/...
+ * Returns: { url, title, timestamps: ["HH:MM:SS", ...] }
+ */
 app.get("/api/timestamps", async (req, res) => {
   try {
     const url = String(req.query.url || "").trim();
@@ -184,12 +183,10 @@ app.get("/api/timestamps", async (req, res) => {
 
     const $ = cheerio.load(fetched.html);
 
-    // Title: try h1 first, then <title>
     const title =
       normalizeSpaces($("h1").first().text()) ||
       normalizeSpaces($("title").text());
 
-    // Pull all visible text; timestamps appear in the page content.
     const text = normalizeSpaces($("body").text());
     const timestamps = extractNotScareTimestampsFromText(text);
 
