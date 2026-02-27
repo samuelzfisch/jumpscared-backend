@@ -6,7 +6,15 @@ const app = express();
 app.use(cors());
 
 const PORT = process.env.PORT || 3000;
-const WTJ_BASE = "https://wheresthejump.com";
+
+// --- NotScare config ---
+const NOTSCARE_SITE = "https://notscare.me";
+const NOTSCARE_SEARCH_API = `${NOTSCARE_SITE}/api/v1/search`;
+
+// Optional: only needed if NotScare requires it for API search
+// Set in Render env vars: NOTSCARE_API_KEY=xxxx
+const NOTSCARE_API_KEY = process.env.NOTSCARE_API_KEY || "";
+
 const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36";
 const FETCH_TIMEOUT_MS = 12000;
@@ -21,10 +29,20 @@ function withTimeout(ms) {
   return { controller, clear: () => clearTimeout(id) };
 }
 
-function isValidWtjUrl(url) {
+function isValidNotScareUrl(url) {
   try {
     const u = new URL(url);
-    return u.protocol === "https:" && u.hostname === "wheresthejump.com";
+    return u.protocol === "https:" && u.hostname === "notscare.me";
+  } catch {
+    return false;
+  }
+}
+
+function isValidNotScareMovieUrl(url) {
+  try {
+    const u = new URL(url);
+    if (!(u.protocol === "https:" && u.hostname === "notscare.me")) return false;
+    return u.pathname.startsWith("/movies/");
   } catch {
     return false;
   }
@@ -37,10 +55,10 @@ async function fetchHtml(url) {
       signal: controller.signal,
       headers: {
         "User-Agent": UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Cache-Control": "no-cache"
-      }
+        "Cache-Control": "no-cache",
+      },
     });
 
     if (!resp.ok) return { ok: false, status: resp.status, html: "" };
@@ -54,96 +72,135 @@ function normalizeToHHMMSS(raw) {
   const parts = String(raw).trim().split(":");
   if (parts.length !== 2 && parts.length !== 3) return null;
 
-  let hh = 0, mm = 0, ss = 0;
+  let hh = 0,
+    mm = 0,
+    ss = 0;
   if (parts.length === 2) {
-    mm = Number(parts[0]); ss = Number(parts[1]);
+    mm = Number(parts[0]);
+    ss = Number(parts[1]);
   } else {
-    hh = Number(parts[0]); mm = Number(parts[1]); ss = Number(parts[2]);
+    hh = Number(parts[0]);
+    mm = Number(parts[1]);
+    ss = Number(parts[2]);
   }
-  if ([hh,mm,ss].some(Number.isNaN) || mm > 59 || ss > 59 || hh > 99) return null;
+  if ([hh, mm, ss].some(Number.isNaN) || mm > 59 || ss > 59 || hh > 99) return null;
 
-  return `${String(hh).padStart(2,"0")}:${String(mm).padStart(2,"0")}:${String(ss).padStart(2,"0")}`;
+  return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}:${String(ss).padStart(2, "0")}`;
+}
+
+function extractNotScareTimestampsFromText(text) {
+  // NotScare pages show HH:MM:SS; we’ll accept H:MM:SS too.
+  const matches = String(text || "").match(/\b(\d{1,2}:\d{2}:\d{2})\b/g) || [];
+  const out = [];
+  const seen = new Set();
+  for (const m of matches) {
+    const t = normalizeToHHMMSS(m);
+    if (t && !seen.has(t)) {
+      seen.add(t);
+      out.push(t);
+    }
+  }
+  return out;
 }
 
 app.get("/api/health", (_req, res) => res.json({ status: "ok" }));
 
+// --- SEARCH ---
+// Keeps same response shape as before: [{ title, url }]
 app.get("/api/search", async (req, res) => {
   try {
     const q = normalizeSpaces(req.query.q);
     if (!q || q.length < 2) return res.status(400).json({ error: "Missing or too-short query `q`." });
 
-    const url = `${WTJ_BASE}/?s=${encodeURIComponent(q)}`;
-    const fetched = await fetchHtml(url);
-    if (!fetched.ok) return res.status(502).json({ error: `WTJ search failed: ${fetched.status}` });
+    // Call NotScare API
+    const apiUrl = `${NOTSCARE_SEARCH_API}?q=${encodeURIComponent(q)}&limit=10`;
 
-    const $ = cheerio.load(fetched.html);
+    const headers = {
+      "User-Agent": UA,
+      Accept: "application/json",
+    };
+    if (NOTSCARE_API_KEY) headers["x-api-key"] = NOTSCARE_API_KEY;
+
+    const { controller, clear } = withTimeout(FETCH_TIMEOUT_MS);
+    let data;
+    try {
+      const resp = await fetch(apiUrl, { headers, signal: controller.signal });
+      if (!resp.ok) {
+        // If this happens and you expect search to work, set NOTSCARE_API_KEY in Render.
+        return res.status(502).json({ error: `NotScare search failed: ${resp.status}` });
+      }
+      data = await resp.json();
+    } finally {
+      clear();
+    }
+
+    // Be flexible about response shape:
+    // - { results: [...] }
+    // - or [...]
+    const rawResults = Array.isArray(data) ? data : Array.isArray(data?.results) ? data.results : [];
 
     const results = [];
     const seen = new Set();
 
-    const selectors = ["article .entry-title a", "h2.entry-title a", "h3.entry-title a", ".entry-title a", "article a"];
-    for (const sel of selectors) {
-      $(sel).each((_, el) => {
-        const href = $(el).attr("href");
-        const title = normalizeSpaces($(el).text());
-        if (!href || !title) return;
+    for (const item of rawResults) {
+      const titleBase = normalizeSpaces(item?.title || item?.name || "");
+      if (!titleBase) continue;
 
-        const full = href.startsWith("http") ? href : WTJ_BASE + href;
-       if (!full.includes("/jump-scares-in-")) return;
-if (!isValidWtjUrl(full)) return;
+      const year = item?.year ? String(item.year) : "";
+      const title = year ? `${titleBase} (${year})` : titleBase;
 
-if (
-  full.includes("/tag/") ||
-  full.includes("/category/") ||
-  full.includes("/?s=")
-) return;
+      // If API includes a URL/slug, use it.
+      let url = "";
+      if (item?.url && typeof item.url === "string") url = item.url;
+      else if (item?.slug && typeof item.slug === "string") url = `${NOTSCARE_SITE}/movies/${item.slug}`;
 
+      // If API does NOT provide a usable URL, skip (client will show no results).
+      if (!url || !isValidNotScareUrl(url)) continue;
 
-        if (!seen.has(full)) {
-          seen.add(full);
-          results.push({ title, url: full });
-        }
-      });
+      if (!seen.has(url)) {
+        seen.add(url);
+        results.push({ title, url });
+      }
       if (results.length >= 10) break;
     }
 
     res.json(results.slice(0, 10));
   } catch (e) {
-    res.status(500).json({ error: e?.name === "AbortError" ? "WTJ search timed out." : "Server error during search." });
+    res.status(500).json({
+      error: e?.name === "AbortError" ? "NotScare search timed out." : "Server error during search.",
+    });
   }
 });
 
+// --- TIMESTAMPS ---
+// Keeps same response shape: { url, title, timestamps: [...] }
 app.get("/api/timestamps", async (req, res) => {
   try {
     const url = String(req.query.url || "").trim();
-    if (!isValidWtjUrl(url)) return res.status(400).json({ error: "Invalid WTJ url." });
+    if (!isValidNotScareMovieUrl(url)) return res.status(400).json({ error: "Invalid NotScare movie url." });
 
     const fetched = await fetchHtml(url);
-    if (!fetched.ok) return res.status(502).json({ error: `WTJ page failed: ${fetched.status}` });
+    if (!fetched.ok) return res.status(502).json({ error: `NotScare page failed: ${fetched.status}` });
 
     const $ = cheerio.load(fetched.html);
-    const title = normalizeSpaces($("h1.entry-title").first().text()) || normalizeSpaces($("title").text());
 
-    const text = normalizeSpaces($(".entry-content").text() || $("body").text());
-    const matches = text.match(/\b(\d{1,2}:\d{2}(?::\d{2})?)\b/g) || [];
+    // Title: try h1 first, then <title>
+    const title =
+      normalizeSpaces($("h1").first().text()) ||
+      normalizeSpaces($("title").text());
 
-    const out = [];
-    const seen = new Set();
-    for (const m of matches) {
-      const t = normalizeToHHMMSS(m);
-      if (t && !seen.has(t)) {
-        seen.add(t);
-        out.push(t);
-      }
-    }
+    // Pull all visible text; timestamps appear in the page content.
+    const text = normalizeSpaces($("body").text());
+    const timestamps = extractNotScareTimestampsFromText(text);
 
-    res.json({ url, title, timestamps: out });
+    res.json({ url, title, timestamps });
   } catch (e) {
-    res.status(500).json({ error: e?.name === "AbortError" ? "WTJ timestamps timed out." : "Server error during timestamps." });
+    res.status(500).json({
+      error: e?.name === "AbortError" ? "NotScare timestamps timed out." : "Server error during timestamps.",
+    });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`JumpScared backend running on port ${PORT}`);
+  console.log(`NotScare backend running on port ${PORT}`);
 });
-
