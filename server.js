@@ -40,8 +40,8 @@ async function fetchHtml(url) {
         "User-Agent": UA,
         Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Cache-Control": "no-cache"
-      }
+        "Cache-Control": "no-cache",
+      },
     });
 
     if (!resp.ok) return { ok: false, status: resp.status, html: "" };
@@ -55,22 +55,31 @@ function normalizeToHHMMSS(raw) {
   const parts = String(raw).trim().split(":");
   if (parts.length !== 2 && parts.length !== 3) return null;
 
-  let hh = 0, mm = 0, ss = 0;
+  let hh = 0,
+    mm = 0,
+    ss = 0;
+
   if (parts.length === 2) {
-    mm = Number(parts[0]); ss = Number(parts[1]);
+    mm = Number(parts[0]);
+    ss = Number(parts[1]);
   } else {
-    hh = Number(parts[0]); mm = Number(parts[1]); ss = Number(parts[2]);
+    hh = Number(parts[0]);
+    mm = Number(parts[1]);
+    ss = Number(parts[2]);
   }
 
-  if ([hh,mm,ss].some(Number.isNaN)) return null;
+  if ([hh, mm, ss].some(Number.isNaN) || mm > 59 || ss > 59 || hh > 99) return null;
 
-  return `${String(hh).padStart(2,"0")}:${String(mm).padStart(2,"0")}:${String(ss).padStart(2,"0")}`;
+  return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}:${String(ss).padStart(2, "0")}`;
 }
 
+// ---- Health ----
 app.get("/api/health", (_req, res) => {
   res.json({ status: "ok", source: "wheresthejump" });
 });
 
+// ---- Search ----
+// Returns: [{ title, url }]
 app.get("/api/search", async (req, res) => {
   try {
     const q = normalizeSpaces(req.query.q);
@@ -89,27 +98,50 @@ app.get("/api/search", async (req, res) => {
     const results = [];
     const seen = new Set();
 
-    $("article .entry-title a").each((_, el) => {
-      const href = $(el).attr("href");
-      const title = normalizeSpaces($(el).text());
-      if (!href || !title) return;
+    // WTJ markup varies, so try multiple selectors then fall back to all links.
+    const selectors = [
+      "article .entry-title a",
+      "h2.entry-title a",
+      "h3.entry-title a",
+      ".entry-title a",
+      "article a",
+      "a",
+    ];
 
-      const full = href.startsWith("http") ? href : WTJ_BASE + href;
+    for (const sel of selectors) {
+      $(sel).each((_, el) => {
+        const href = $(el).attr("href");
+        const title = normalizeSpaces($(el).text());
+        if (!href || !title) return;
 
-      if (!full.includes("/jump-scares-in-")) return;
-      if (!isValidWtjUrl(full)) return;
-      if (seen.has(full)) return;
+        const full = href.startsWith("http") ? href : WTJ_BASE + href;
 
-      seen.add(full);
-      results.push({ title, url: full });
-    });
+        // Keep only actual movie pages
+        if (!full.includes("/jump-scares-in-")) return;
+        if (!isValidWtjUrl(full)) return;
+
+        // Remove obvious junk
+        if (full.includes("/tag/") || full.includes("/category/") || full.includes("/?s=")) return;
+
+        if (!seen.has(full)) {
+          seen.add(full);
+          results.push({ title, url: full });
+        }
+      });
+
+      if (results.length >= 10) break;
+    }
 
     res.json(results.slice(0, 10));
-  } catch {
-    res.status(500).json({ error: "Server error during search." });
+  } catch (e) {
+    res.status(500).json({
+      error: e?.name === "AbortError" ? "WTJ search timed out." : "Server error during search.",
+    });
   }
 });
 
+// ---- Timestamps ----
+// Returns: { url, title, timestamps: ["HH:MM:SS", ...] }
 app.get("/api/timestamps", async (req, res) => {
   try {
     const url = String(req.query.url || "").trim();
@@ -123,8 +155,10 @@ app.get("/api/timestamps", async (req, res) => {
     }
 
     const $ = cheerio.load(fetched.html);
-    const title = normalizeSpaces($("h1.entry-title").first().text()) ||
-                  normalizeSpaces($("title").text());
+
+    const title =
+      normalizeSpaces($("h1.entry-title").first().text()) ||
+      normalizeSpaces($("title").text());
 
     const text = normalizeSpaces($(".entry-content").text() || $("body").text());
     const matches = text.match(/\b(\d{1,2}:\d{2}(?::\d{2})?)\b/g) || [];
@@ -141,8 +175,10 @@ app.get("/api/timestamps", async (req, res) => {
     }
 
     res.json({ url, title, timestamps: out });
-  } catch {
-    res.status(500).json({ error: "Server error during timestamps." });
+  } catch (e) {
+    res.status(500).json({
+      error: e?.name === "AbortError" ? "WTJ timestamps timed out." : "Server error during timestamps.",
+    });
   }
 });
 
